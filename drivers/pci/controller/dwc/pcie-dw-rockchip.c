@@ -491,6 +491,11 @@ static int rk_pcie_enable_power(struct rk_pcie *rk_pcie)
 	ret = regulator_enable(rk_pcie->vpcie3v3);
 	if (ret)
 		dev_err(dev, "fail to enable vpcie3v3 regulator\n");
+	else if (!strcmp(dev_name(dev), "fe150000.pcie"))
+		dev_info(dev, "ulan-pcie power-on: t_ns=%llu voltage=%d enabled=%d\n",
+			 (unsigned long long)ktime_get_ns(),
+			 regulator_get_voltage(rk_pcie->vpcie3v3),
+			 regulator_is_enabled(rk_pcie->vpcie3v3));
 
 	return ret;
 }
@@ -564,6 +569,13 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
 	for (hw_retries = 0; hw_retries < RK_PCIE_ENUM_HW_RETRYIES; hw_retries++) {
 		/* Rest the device */
 		gpiod_set_value_cansleep(rk_pcie->rst_gpio, 0);
+		if (!strcmp(dev_name(pci->dev), "fe150000.pcie"))
+			dev_info(pci->dev,
+				 "ulan-pcie perst-assert: t_ns=%llu value=%d delay_ms=%u attempt=%d power=%#x\n",
+				 (unsigned long long)ktime_get_ns(),
+				 gpiod_get_value_cansleep(rk_pcie->rst_gpio),
+				 rk_pcie->perst_inactive_ms, hw_retries,
+				 rk_pcie_readl_apb(rk_pcie, PCIE_CLIENT_POWER));
 
 		rk_pcie_disable_ltssm(rk_pcie);
 		rk_pcie_link_status_clear(rk_pcie);
@@ -605,6 +617,13 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
 
 		rockchip_pcie_ltssm_trace(rk_pcie, true);
 		gpiod_set_value_cansleep(rk_pcie->rst_gpio, 1);
+		if (!strcmp(dev_name(pci->dev), "fe150000.pcie"))
+			dev_info(pci->dev,
+				 "ulan-pcie perst-release: t_ns=%llu value=%d ltssm=%#x power=%#x\n",
+				 (unsigned long long)ktime_get_ns(),
+				 gpiod_get_value_cansleep(rk_pcie->rst_gpio),
+				 rk_pcie_readl_apb(rk_pcie, PCIE_CLIENT_LTSSM_STATUS),
+				 rk_pcie_readl_apb(rk_pcie, PCIE_CLIENT_POWER));
 
 		/*
 		 * Add this delay because we observe devices need a period of time to be able to
@@ -616,6 +635,9 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
 
 		for (retries = 0; retries < rk_pcie->wait_for_link_ms / 20; retries++) {
 			if (dw_pcie_link_up(pci)) {
+				u64 link_detect_ns = ktime_get_ns();
+				u64 link_settled_ns;
+
 				/*
 				 * We may be here in case of L0 in Gen1. But if EP is capable
 				 * of Gen2 or Gen3, Gen switch may happen just in this time, but
@@ -624,13 +646,21 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
 				 * more for Gen switch.
 				 */
 				msleep(50);
+				link_settled_ns = ktime_get_ns();
 				/* In case link drop after linkup, double check it */
 				if (dw_pcie_link_up(pci)) {
+					if (!strcmp(dev_name(pci->dev), "fe150000.pcie"))
+						dev_info(pci->dev,
+							 "ulan-pcie link-observe: detected_ns=%llu settled_ns=%llu wait_us=%llu\n",
+							 link_detect_ns, link_settled_ns,
+							 (link_settled_ns - link_detect_ns) / 1000);
 					dev_info(pci->dev, "PCIe Link up, LTSSM is 0x%x\n",
 						rk_pcie_readl_apb(rk_pcie, PCIE_CLIENT_LTSSM_STATUS));
 					rk_pcie_debug_dump(rk_pcie);
 					if (rk_pcie->slot_pluggable)
 						rk_pcie->hp_no_link = false;
+					dev_info(pci->dev, "gddbg: add 100ms delay follow pcie spec\n");
+					msleep(100); // added by Raymond
 					return 0;
 				}
 			}
@@ -1701,7 +1731,9 @@ static int rk_pcie_hardware_io_config(struct rk_pcie *rk_pcie)
 		goto disable_clk;
 	}
 
-	phy_power_on(rk_pcie->phy);
+	ret = phy_power_on(rk_pcie->phy);
+	if (!strcmp(dev_name(dev), "fe150000.pcie"))
+		dev_info(dev, "ulan-pcie phy-power-on: result=%d\n", ret);
 
 	/* Release resets after PHY is working */
 	reset_control_deassert(rk_pcie->rsts);
@@ -1711,6 +1743,11 @@ static int rk_pcie_hardware_io_config(struct rk_pcie *rk_pcie)
 		dev_err(dev, "phy lock failed\n");
 		goto disable_phy;
 	}
+	if (!strcmp(dev_name(dev), "fe150000.pcie"))
+		dev_info(dev, "ulan-pcie io-ready: clocks=%u regulator=%d\n",
+			 rk_pcie->clk_cnt,
+			 IS_ERR(rk_pcie->vpcie3v3) ? -ENODEV :
+			 regulator_is_enabled(rk_pcie->vpcie3v3));
 
 	return 0;
 
@@ -1859,6 +1896,32 @@ static int rk_pcie_host_unconfig(struct rk_pcie *rk_pcie)
 	return 0;
 }
 
+static void ulan_pcie_log_host(struct rk_pcie *pcie, const char *stage, int rc)
+{
+	struct device *dev = pcie->pci->dev;
+	int i;
+
+	if (strcmp(dev_name(dev), "fe150000.pcie"))
+		return;
+	dev_info(dev,
+		 "ulan-pcie host-state: stage=%s t_ns=%llu pid=%d task=%s rc=%d perst_logical=%d perst_raw=%d active_low=%d supply_uv=%d supply_enabled=%d reset_status=%d runtime_active=%d clkreq=%u bifurcation=%u perst_ms=%u ltssm=%#x power=%#x common=%#x misc_irq=%#x\n",
+		 stage, (unsigned long long)ktime_get_ns(), task_pid_nr(current),
+		 current->comm, rc, gpiod_get_value_cansleep(pcie->rst_gpio),
+		 gpiod_get_raw_value_cansleep(pcie->rst_gpio),
+		 pcie->rst_gpio ? gpiod_is_active_low(pcie->rst_gpio) : -ENODEV,
+		 IS_ERR(pcie->vpcie3v3) ? -ENODEV : regulator_get_voltage(pcie->vpcie3v3),
+		 IS_ERR(pcie->vpcie3v3) ? -ENODEV : regulator_is_enabled(pcie->vpcie3v3),
+		 reset_control_status(pcie->rsts), pm_runtime_active(dev),
+		 pcie->supports_clkreq, pcie->bifurcation, pcie->perst_inactive_ms,
+		 rk_pcie_readl_apb(pcie, PCIE_CLIENT_LTSSM_STATUS),
+		 rk_pcie_readl_apb(pcie, PCIE_CLIENT_POWER),
+		 rk_pcie_readl_apb(pcie, PCIE_CLIENT_CDM_RASDES_TBA_INFO_CMN),
+		 rk_pcie_readl_apb(pcie, PCIE_CLIENT_INTR_STATUS_MISC));
+	for (i = 0; i < pcie->clk_cnt; i++)
+		dev_info(dev, "ulan-pcie clock: stage=%s id=%s rate_hz=%lu\n",
+			 stage, pcie->clks[i].id, clk_get_rate(pcie->clks[i].clk));
+}
+
 static int rk_pcie_really_probe(void *p)
 {
 	struct platform_device *pdev = p;
@@ -1919,7 +1982,9 @@ static int rk_pcie_really_probe(void *p)
 	if (ret)
 		goto unconfig_host;
 
+	ulan_pcie_log_host(rk_pcie, "before-host-init", 0);
 	ret = rk_add_pcie_port(rk_pcie, pdev);
+	ulan_pcie_log_host(rk_pcie, "after-host-init", ret);
 
 	if (rk_pcie->is_signal_test == true)
 		return 0;

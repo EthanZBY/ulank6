@@ -11,6 +11,7 @@
 #include <linux/iopoll.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
+#include <linux/ktime.h>
 #include <linux/msi.h>
 #include <linux/of_address.h>
 #include <linux/of_pci.h>
@@ -628,8 +629,20 @@ static int dw_pcie_rd_other_conf(struct pci_bus *bus, unsigned int devfn,
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct dw_pcie_ob_atu_cfg atu = { 0 };
 	int ret;
+	bool trace_vendor_read = !strcmp(dev_name(pci->dev), "fe150000.pcie") &&
+				 bus->number == 1 && devfn == 0 && where == 0;
+	u64 cfg_begin_ns = 0, cfg_end_ns;
 
+	if (trace_vendor_read)
+		cfg_begin_ns = ktime_get_ns();
 	ret = pci_generic_config_read(bus, devfn, where, size, val);
+	if (trace_vendor_read) {
+		cfg_end_ns = ktime_get_ns();
+		dev_info(pci->dev,
+			 "ulan-pcie vendor-read: begin_ns=%llu end_ns=%llu bus=%u devfn=%u size=%d rc=%d value=%#x\n",
+			 cfg_begin_ns, cfg_end_ns, bus->number, devfn, size,
+			 ret, ret == PCIBIOS_SUCCESSFUL ? *val : ~0U);
+	}
 	if (ret != PCIBIOS_SUCCESSFUL)
 		return ret;
 
@@ -697,6 +710,32 @@ static struct pci_ops dw_pcie_ops = {
 	.write = pci_generic_config_write,
 };
 
+static void ulan_pcie_log_iatu(struct dw_pcie *pci, const char *stage)
+{
+	u32 dir, index, count, atu_dir;
+	void __iomem *base;
+
+	if (strcmp(dev_name(pci->dev), "fe150000.pcie") ||
+	    !dw_pcie_cap_is(pci, IATU_UNROLL))
+		return;
+	/* This target has unrolled registers; observation writes no viewport. */
+	for (dir = 0; dir < 2; dir++) {
+		atu_dir = dir ? PCIE_ATU_REGION_DIR_IB : PCIE_ATU_REGION_DIR_OB;
+		count = min_t(u32, dir ? pci->num_ib_windows : pci->num_ob_windows, 8);
+		for (index = 0; index < count; index++) {
+			base = pci->atu_base + PCIE_ATU_UNROLL_BASE(atu_dir, index);
+			dev_info(pci->dev,
+				 "ulan-pcie iatu-state: stage=%s t_ns=%llu direction=%s index=%u ctrl1=%#x ctrl2=%#x base_lo=%#x base_hi=%#x limit_lo=%#x limit_hi=%#x target_lo=%#x target_hi=%#x\n",
+				 stage, (unsigned long long)ktime_get_ns(), dir ? "inbound" : "outbound", index,
+				 readl(base + PCIE_ATU_REGION_CTRL1),
+				 readl(base + PCIE_ATU_REGION_CTRL2),
+				 readl(base + PCIE_ATU_LOWER_BASE), readl(base + PCIE_ATU_UPPER_BASE),
+				 readl(base + PCIE_ATU_LIMIT), readl(base + PCIE_ATU_UPPER_LIMIT),
+				 readl(base + PCIE_ATU_LOWER_TARGET), readl(base + PCIE_ATU_UPPER_TARGET));
+		}
+	}
+}
+
 static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
@@ -717,6 +756,10 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 	for (i = 0; i < pci->num_ob_windows; i++)
 		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_OB, i);
 
+	if (!strcmp(dev_name(pci->dev), "fe150000.pcie"))
+		dev_info(pci->dev, "ulan-pcie inbound-setup: dma-ranges=%s windows=%u\n",
+			 list_empty(&pp->bridge->dma_ranges) ? "empty" : "present",
+			 pci->num_ib_windows);
 	for (i = 0; i < pci->num_ib_windows; i++)
 		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_IB, i);
 
@@ -790,12 +833,19 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 				entry->res);
 			return ret;
 		}
+		if (!strcmp(dev_name(pci->dev), "fe150000.pcie"))
+			dev_info(pci->dev,
+				 "ulan-pcie inbound-ready: index=%d cpu=%#llx pci=%#llx size=%#llx\n",
+				 i - 1, (unsigned long long)entry->res->start,
+				 (unsigned long long)(entry->res->start - entry->offset),
+				 (unsigned long long)resource_size(entry->res));
 	}
 
 	if (pci->num_ib_windows <= i)
 		dev_warn(pci->dev, "Dma-ranges exceed inbound iATU size (%u)\n",
 			 pci->num_ib_windows);
 
+	ulan_pcie_log_iatu(pci, "after-iatu-setup");
 	return 0;
 }
 

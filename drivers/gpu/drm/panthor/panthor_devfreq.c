@@ -120,6 +120,8 @@ static struct devfreq_dev_profile panthor_devfreq_profile = {
 	.polling_ms = 50, /* ~3 frames */
 	.target = panthor_devfreq_target,
 	.get_dev_status = panthor_devfreq_get_dev_status,
+	/* The devfreq core unregisters cooling before freeing devfreq on probe failure. */
+	.is_cooling_device = true,
 };
 
 int panthor_devfreq_init(struct panthor_device *ptdev)
@@ -131,7 +133,6 @@ int panthor_devfreq_init(struct panthor_device *ptdev)
 	 * the coupling logic deal with voltage updates.
 	 */
 	static const char * const reg_names[] = { "mali", NULL };
-	struct thermal_cooling_device *cooling;
 	struct device *dev = ptdev->base.dev;
 	struct panthor_devfreq *pdevfreq;
 	struct dev_pm_opp *opp;
@@ -235,10 +236,6 @@ int panthor_devfreq_init(struct panthor_device *ptdev)
 		pdevfreq->devfreq = NULL;
 		return ret;
 	}
-
-	cooling = devfreq_cooling_em_register(pdevfreq->devfreq, NULL);
-	if (IS_ERR(cooling))
-		DRM_DEV_INFO(dev, "Failed to register cooling device\n");
 
 	return 0;
 }

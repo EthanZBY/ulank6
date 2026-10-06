@@ -11,9 +11,12 @@
 #include <linux/blk-mq-pci.h>
 #include <linux/blk-integrity.h>
 #include <linux/dmi.h>
+#include <linux/dma-direct.h>
+#include <linux/dma-map-ops.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/kstrtox.h>
 #include <linux/memremap.h>
 #include <linux/mm.h>
@@ -24,6 +27,7 @@
 #include <linux/suspend.h>
 #include <linux/t10-pi.h>
 #include <linux/types.h>
+#include <linux/vmalloc.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
@@ -170,6 +174,10 @@ struct nvme_dev {
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
+	/* Temporary, bounded observations for the original Yourland SSD. */
+	bool ulan_diag_waiting;
+	unsigned long ulan_diag_next;
+	unsigned int ulan_diag_samples;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -1915,16 +1923,193 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
 	return 0;
 }
 
+static void ulan_nvme_log_pci_state(struct nvme_dev *dev, const char *stage)
+{
+	struct pci_dev *ep = to_pci_dev(dev->dev);
+	struct pci_dev *rp = ep->bus->self;
+	u16 command = 0xffff, pmcsr = 0xffff, devctl = 0xffff;
+	u16 devsta = 0xffff, lnkctl = 0xffff, lnksta = 0xffff;
+	u16 rp_command = 0xffff, rp_devsta = 0xffff;
+	u16 rp_lnkctl = 0xffff, rp_lnksta = 0xffff;
+	u16 devctl2 = 0xffff, rp_devctl = 0xffff, rp_devctl2 = 0xffff;
+	u32 ep_uncor = 0xffffffff, ep_cor = 0xffffffff;
+	u32 rp_uncor = 0xffffffff, rp_cor = 0xffffffff;
+	int cap;
+
+	if (ep->vendor != 0x1f03 || ep->device != 0x1202)
+		return;
+
+	pci_read_config_word(ep, PCI_COMMAND, &command);
+	cap = pci_find_capability(ep, PCI_CAP_ID_PM);
+	if (cap)
+		pci_read_config_word(ep, cap + PCI_PM_CTRL, &pmcsr);
+	pcie_capability_read_word(ep, PCI_EXP_DEVCTL, &devctl);
+	pcie_capability_read_word(ep, PCI_EXP_DEVSTA, &devsta);
+	pcie_capability_read_word(ep, PCI_EXP_LNKCTL, &lnkctl);
+	pcie_capability_read_word(ep, PCI_EXP_LNKSTA, &lnksta);
+	pcie_capability_read_word(ep, PCI_EXP_DEVCTL2, &devctl2);
+	cap = pci_find_ext_capability(ep, PCI_EXT_CAP_ID_ERR);
+	if (cap) {
+		pci_read_config_dword(ep, cap + PCI_ERR_UNCOR_STATUS, &ep_uncor);
+		pci_read_config_dword(ep, cap + PCI_ERR_COR_STATUS, &ep_cor);
+	}
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme %s endpoint: cmd=%#x pmcsr=%#x devctl=%#x devsta=%#x lnkctl=%#x lnksta=%#x aer_ue=%#x aer_ce=%#x devctl2=%#x irq=%d vectors=%u\n",
+		 stage, command, pmcsr, devctl, devsta, lnkctl, lnksta,
+		 ep_uncor, ep_cor, devctl2, ep->irq, dev->num_vecs);
+
+	if (!rp)
+		return;
+	pci_read_config_word(rp, PCI_COMMAND, &rp_command);
+	pcie_capability_read_word(rp, PCI_EXP_DEVSTA, &rp_devsta);
+	pcie_capability_read_word(rp, PCI_EXP_LNKCTL, &rp_lnkctl);
+	pcie_capability_read_word(rp, PCI_EXP_LNKSTA, &rp_lnksta);
+	pcie_capability_read_word(rp, PCI_EXP_DEVCTL, &rp_devctl);
+	pcie_capability_read_word(rp, PCI_EXP_DEVCTL2, &rp_devctl2);
+	cap = pci_find_ext_capability(rp, PCI_EXT_CAP_ID_ERR);
+	if (cap) {
+		pci_read_config_dword(rp, cap + PCI_ERR_UNCOR_STATUS, &rp_uncor);
+		pci_read_config_dword(rp, cap + PCI_ERR_COR_STATUS, &rp_cor);
+	}
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme %s root-port: cmd=%#x devsta=%#x lnkctl=%#x lnksta=%#x aer_ue=%#x aer_ce=%#x devctl=%#x devctl2=%#x\n",
+		 stage, rp_command, rp_devsta, rp_lnkctl, rp_lnksta,
+		 rp_uncor, rp_cor, rp_devctl, rp_devctl2);
+}
+
+static void ulan_nvme_log_rasdes(struct nvme_dev *dev, const char *stage)
+{
+	/* Selectors match rockchip_pcie_rasdes_show(); never clear counters. */
+	static const struct { u32 selector; const char *name; } events[] = {
+		{ 0x0000000, "EBUF_Overflow" }, { 0x0010000, "EBUF_Under_run" },
+		{ 0x0020000, "Decode_Error" }, { 0x0030000, "Running_Disparity" },
+		{ 0x0040000, "SKP_OS_Parity" }, { 0x0050000, "SYNC_Header" },
+		{ 0x0060000, "CTL_SKP_OS_Parity" }, { 0x1050000, "Detect_EI_Infer" },
+		{ 0x1060000, "Receiver_Error" }, { 0x1070000, "Rx_Recovery_Request" },
+		{ 0x1080000, "N_FTS_Timeout" }, { 0x1090000, "Framing_Error" },
+		{ 0x10a0000, "Deskew_Error" }, { 0x2000000, "BAD_TLP" },
+		{ 0x2010000, "LCRC_Error" }, { 0x2020000, "BAD_DLLP" },
+		{ 0x2030000, "Replay_Number_Rollover" }, { 0x2040000, "Replay_Timeout" },
+		{ 0x2050000, "Rx_Nak_DLLP" }, { 0x2060000, "Tx_Nak_DLLP" },
+		{ 0x2070000, "Retry_TLP" }, { 0x3000000, "FC_Timeout" },
+		{ 0x3010000, "Poisoned_TLP" }, { 0x3020000, "ECRC_Error" },
+		{ 0x3030000, "Unsupported_Request" }, { 0x3040000, "Completer_Abort" },
+		{ 0x3050000, "Completion_Timeout" },
+	};
+	struct pci_dev *ep = to_pci_dev(dev->dev), *rp = ep->bus->self;
+	u32 vendor, saved, restored, count;
+	int cap, i, rc;
+
+	if (ep->vendor != 0x1f03 || ep->device != 0x1202 || !rp)
+		return;
+	cap = pci_find_ext_capability(rp, PCI_EXT_CAP_ID_VNDR);
+	if (!cap || pci_read_config_dword(rp, cap + 4, &vendor) ||
+	    (vendor & 0xffff) != 2 ||
+	    pci_read_config_dword(rp, cap + 8, &saved) || (saved & 0x1f)) {
+		dev_info(dev->ctrl.device, "ulan-nvme rasdes-unavailable: stage=%s cap=%#x\n",
+			 stage, cap);
+		return;
+	}
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme rasdes-begin: stage=%s t_ns=%llu cap=%#x selector=%#x\n",
+		 stage, (unsigned long long)ktime_get_ns(), cap, saved);
+	for (i = 0; i < ARRAY_SIZE(events); i++) {
+		rc = pci_write_config_dword(rp, cap + 8, events[i].selector);
+		if (rc)
+			break;
+		rc = pci_read_config_dword(rp, cap + 12, &count);
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme rasdes: stage=%s event=%s selector=%#x rc=%d count=%#x\n",
+			 stage, events[i].name, events[i].selector, rc, rc ? ~0U : count);
+		if (rc)
+			break;
+	}
+	rc = pci_write_config_dword(rp, cap + 8, saved);
+	if (!rc)
+		rc = pci_read_config_dword(rp, cap + 8, &restored);
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme rasdes-restore: stage=%s rc=%d saved=%#x readback=%#x\n",
+		 stage, rc, saved, rc ? ~0U : restored);
+}
+
+static void ulan_nvme_log_dma(struct nvme_dev *dev, struct nvme_queue *q)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	const struct dma_map_ops *ops;
+	const struct bus_dma_region *map;
+	struct iommu_domain *domain;
+	void *buffers[2] = { q->sq_cmds, q->cqes };
+	dma_addr_t addresses[2] = { q->sq_dma_addr, q->cq_dma_addr };
+	int i;
+
+	if (pdev->vendor != 0x1f03 || pdev->device != 0x1202)
+		return;
+	ops = get_dma_ops(dev->dev);
+	domain = iommu_get_domain_for_dev(dev->dev);
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme dma-path: t_ns=%llu coherent=%u ops=%px alloc=%ps iommu=%px domain_type=%#x bus_limit=%#llx\n",
+		 (unsigned long long)ktime_get_ns(), dev_is_dma_coherent(dev->dev),
+		 ops, ops ? ops->alloc : NULL, domain, domain ? domain->type : 0,
+		 (unsigned long long)dev->dev->bus_dma_limit);
+	map = dev->dev->dma_range_map;
+	for (i = 0; map && i < 8 && map[i].size; i++)
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme dma-range: index=%d cpu=%#llx dma=%#llx size=%#llx\n",
+			 i, (unsigned long long)map[i].cpu_start,
+			 (unsigned long long)map[i].dma_start,
+			 (unsigned long long)map[i].size);
+	dev_info(dev->ctrl.device, "ulan-nvme dma-range-count: count=%d map=%px\n", i, map);
+	for (i = 0; i < 2; i++) {
+		struct page *page = NULL;
+		phys_addr_t physical = 0;
+
+		if (is_vmalloc_addr(buffers[i]))
+			page = vmalloc_to_page(buffers[i]);
+		else if (virt_addr_valid(buffers[i]))
+			page = virt_to_page(buffers[i]);
+		if (page)
+			physical = page_to_phys(page) + offset_in_page(buffers[i]);
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme queue-page: queue=%s cpu_va=%px page_valid=%u physical=%#llx dma=%#llx\n",
+			 i ? "CQ" : "SQ", buffers[i], !!page,
+			 (unsigned long long)physical, (unsigned long long)addresses[i]);
+	}
+}
+
+static void ulan_nvme_log_admin_state(struct nvme_dev *dev, const char *stage,
+		int rc)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+
+	if (pdev->vendor != 0x1f03 || pdev->device != 0x1202)
+		return;
+	dev_info(dev->ctrl.device,
+		 "ulan-nvme admin-state: stage=%s t_ns=%llu pid=%d task=%s rc=%d CAP=%#llx VS=%#x CC=%#x CSTS=%#x AQA=%#x ASQ=%#llx ACQ=%#llx BAR=%#llx\n",
+		 stage, (unsigned long long)ktime_get_ns(), task_pid_nr(current),
+		 current->comm, rc,
+		 (unsigned long long)lo_hi_readq(dev->bar + NVME_REG_CAP),
+		 readl(dev->bar + NVME_REG_VS), readl(dev->bar + NVME_REG_CC),
+		 readl(dev->bar + NVME_REG_CSTS), readl(dev->bar + NVME_REG_AQA),
+		 (unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ASQ),
+		 (unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ACQ),
+		 (unsigned long long)pci_resource_start(pdev, 0));
+}
+
 static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 {
 	int result;
 	u32 aqa;
 	struct nvme_queue *nvmeq;
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	u16 command = 0, pmcsr = 0, link = 0;
+	int pm_cap = 0;
 
 	result = nvme_remap_bar(dev, db_bar_size(dev, 0));
 	if (result < 0)
 		return result;
 
+	ulan_nvme_log_admin_state(dev, "before-disable", 0);
+	ulan_nvme_log_pci_state(dev, "before-disable");
 	dev->subsystem = readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 1, 0) ?
 				NVME_CAP_NSSRC(dev->ctrl.cap) : 0;
 
@@ -1940,6 +2125,7 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	 * might be pointing at!
 	 */
 	result = nvme_disable_ctrl(&dev->ctrl, false);
+	ulan_nvme_log_admin_state(dev, "after-disable", result);
 	if (result < 0) {
 		struct pci_dev *pdev = to_pci_dev(dev->dev);
 
@@ -1970,14 +2156,46 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	dev->ctrl.numa_node = dev_to_node(dev->dev);
 
 	nvmeq = &dev->queues[0];
+	ulan_nvme_log_dma(dev, nvmeq);
+	if (pdev->vendor == 0x1f03 && pdev->device == 0x1202)
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme admin-memory: t_ns=%llu depth=%u SQ_DMA=%#llx CQ_DMA=%#llx DMA_MASK=%#llx COHERENT_MASK=%#llx\n",
+			 (unsigned long long)ktime_get_ns(), nvmeq->q_depth,
+			 (unsigned long long)nvmeq->sq_dma_addr,
+			 (unsigned long long)nvmeq->cq_dma_addr,
+			 (unsigned long long)dma_get_mask(dev->dev),
+			 (unsigned long long)dev->dev->coherent_dma_mask);
 	aqa = nvmeq->q_depth - 1;
 	aqa |= aqa << 16;
 
 	writel(aqa, dev->bar + NVME_REG_AQA);
 	lo_hi_writeq(nvmeq->sq_dma_addr, dev->bar + NVME_REG_ASQ);
 	lo_hi_writeq(nvmeq->cq_dma_addr, dev->bar + NVME_REG_ACQ);
+	if (pdev->vendor == 0x1f03 && pdev->device == 0x1202) {
+		pm_cap = pci_find_capability(pdev, PCI_CAP_ID_PM);
+		pci_read_config_word(pdev, PCI_COMMAND, &command);
+		if (pm_cap)
+			pci_read_config_word(pdev, pm_cap + PCI_PM_CTRL, &pmcsr);
+		pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &link);
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme before-enable: AQA=%#x ASQ=%#llx ACQ=%#llx CC=%#x CSTS=%#x PCI_CMD=%#x PMCSR=%#x LNKSTA=%#x\n",
+			 readl(dev->bar + NVME_REG_AQA),
+			 (unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ASQ),
+			 (unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ACQ),
+			 readl(dev->bar + NVME_REG_CC),
+			 readl(dev->bar + NVME_REG_CSTS),
+			 command, pmcsr, link);
+		ulan_nvme_log_pci_state(dev, "before-enable");
+	}
 
+	ulan_nvme_log_rasdes(dev, "before-enable");
+	dev->ulan_diag_samples = 0;
+	dev->ulan_diag_next = jiffies + HZ;
+	dev->ulan_diag_waiting = pdev->vendor == 0x1f03 && pdev->device == 0x1202;
 	result = nvme_enable_ctrl(&dev->ctrl);
+	dev->ulan_diag_waiting = false;
+	ulan_nvme_log_admin_state(dev, "after-enable", result);
+	ulan_nvme_log_rasdes(dev, "after-enable");
 #ifdef CONFIG_NVME_HW_RESET
 	if (result) {
 		nvme_hw_reset(dev);
@@ -1985,6 +2203,23 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 		result = nvme_enable_ctrl(&dev->ctrl);
 	}
 #endif
+	if (result && pdev->vendor == 0x1f03 && pdev->device == 0x1202) {
+		ulan_nvme_log_pci_state(dev, "enable-failed");
+		pci_read_config_word(pdev, PCI_COMMAND, &command);
+		if (pm_cap)
+			pci_read_config_word(pdev, pm_cap + PCI_PM_CTRL, &pmcsr);
+		pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &link);
+		dev_err(dev->ctrl.device,
+			"ulan-nvme enable-failed: rc=%d CAP=%#llx AQA=%#x ASQ=%#llx ACQ=%#llx CC=%#x CSTS=%#x PCI_CMD=%#x PMCSR=%#x LNKSTA=%#x\n",
+			result,
+			(unsigned long long)lo_hi_readq(dev->bar + NVME_REG_CAP),
+			readl(dev->bar + NVME_REG_AQA),
+			(unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ASQ),
+			(unsigned long long)lo_hi_readq(dev->bar + NVME_REG_ACQ),
+			readl(dev->bar + NVME_REG_CC),
+			readl(dev->bar + NVME_REG_CSTS),
+			command, pmcsr, link);
+	}
 	if (result)
 		return result;
 
@@ -2747,6 +2982,11 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	result = pci_alloc_irq_vectors(pdev, 1, 1, flags);
 	if (result < 0)
 		goto disable;
+	if (pdev->vendor == 0x1f03 && pdev->device == 0x1202)
+		dev_info(dev->ctrl.device,
+			 "ulan-nvme pci-enabled: irq_vectors=%d dma_mask=%#llx pci_state=%d\n",
+			 result, (unsigned long long)*pdev->dev.dma_mask,
+			 pdev->current_state);
 
 	dev->ctrl.cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
 
@@ -2797,6 +3037,9 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	result = nvme_pci_configure_admin_queue(dev);
 	if (result)
 		goto free_irq;
+	if (pdev->vendor == 0x1f03 && pdev->device == 0x1202)
+		dev_info(dev->ctrl.device, "ulan-nvme admin-ready: CSTS=%#x\n",
+			 readl(dev->bar + NVME_REG_CSTS));
 	return result;
 
  free_irq:
@@ -3075,7 +3318,20 @@ static void nvme_reset_work(struct work_struct *work)
 
 static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
 {
-	*val = readl(to_nvme_dev(ctrl)->bar + off);
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
+
+	*val = readl(dev->bar + off);
+	/* The Ready wait owns these fields; no worker or lasting timer is added. */
+	if (off == NVME_REG_CSTS && dev->ulan_diag_waiting &&
+	    dev->ulan_diag_samples < 16 && time_after_eq(jiffies, dev->ulan_diag_next)) {
+		dev->ulan_diag_next = jiffies + 10 * HZ;
+		dev_info(ctrl->device,
+			 "ulan-nvme wait-observe: sample=%u t_ns=%llu CC=%#x CSTS=%#x\n",
+			 ++dev->ulan_diag_samples, (unsigned long long)ktime_get_ns(),
+			 readl(dev->bar + NVME_REG_CC), *val);
+		ulan_nvme_log_pci_state(dev, "ready-poll");
+		ulan_nvme_log_rasdes(dev, "ready-poll");
+	}
 	return 0;
 }
 

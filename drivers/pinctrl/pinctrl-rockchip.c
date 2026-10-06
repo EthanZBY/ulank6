@@ -1520,8 +1520,11 @@ static int rockchip_set_mux(struct rockchip_pin_bank *bank, int pin, int mux)
 	struct regmap *regmap;
 	struct regmap *regmap_sys;
 	int reg, ret, mask, mux_type;
+	int uart2_m1_before_ret = 0, uart2_m1_after_ret = 0;
 	u8 bit;
 	u32 data, rmask, route_location, route_reg, route_val;
+	u32 uart2_m1_before = 0, uart2_m1_after = 0;
+	bool trace_uart2_m1;
 
 	if (group_info && rockchip_check_group_pins(bank, pin)) {
 		dev_err(bank->dev, "GPIO%d-%d set mux failed, please check group info\n",
@@ -1662,6 +1665,12 @@ static int rockchip_set_mux(struct rockchip_pin_bank *bank, int pin, int mux)
 	if (mux > mask)
 		return -EINVAL;
 
+	trace_uart2_m1 = ctrl->type == RK3588 && bank->bank_num == 4 &&
+			 (pin == RK_PD0 || pin == RK_PD1);
+	if (trace_uart2_m1)
+		uart2_m1_before_ret = regmap_read(regmap, reg,
+						 &uart2_m1_before);
+
 	if (bank->route_mask & BIT(pin)) {
 		if (rockchip_get_mux_route(bank, pin, mux, &route_location,
 					   &route_reg, &route_val)) {
@@ -1700,6 +1709,16 @@ static int rockchip_set_mux(struct rockchip_pin_bank *bank, int pin, int mux)
 
 	if (ctrl->ie_calc_reg)
 		rockchip_set_input_enable(bank, pin, 1);
+
+	if (trace_uart2_m1) {
+		uart2_m1_after_ret = regmap_read(regmap, reg,
+						&uart2_m1_after);
+		dev_info(dev,
+			 "ULAN_UART2_M1 GPIO4D%d mux=%d reg=0x%x before=0x%x read_before=%d after=0x%x read_after=%d write=%d\n",
+			 pin - RK_PD0, mux, reg, uart2_m1_before,
+			 uart2_m1_before_ret, uart2_m1_after,
+			 uart2_m1_after_ret, ret);
+	}
 
 	return ret;
 }

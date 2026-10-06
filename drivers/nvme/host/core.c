@@ -2414,30 +2414,82 @@ const struct block_device_operations nvme_bdev_ops = {
 	.pr_ops		= &nvme_pr_ops,
 };
 
+/* Read back each PCIe CC transition without changing reset/enable policy. */
+static void ulan_nvme_log_ctrl_state(struct nvme_ctrl *ctrl, const char *stage,
+		int write_rc)
+{
+	u32 cc = 0, csts = 0;
+	int cc_rc, csts_rc;
+
+	if (strcmp(ctrl->ops->name, "pcie"))
+		return;
+	cc_rc = ctrl->ops->reg_read32(ctrl, NVME_REG_CC, &cc);
+	csts_rc = ctrl->ops->reg_read32(ctrl, NVME_REG_CSTS, &csts);
+	dev_info(ctrl->device,
+		 "ulan-nvme state: stage=%s t_ns=%llu pid=%d task=%s ctrl=%px requested_CC=%#x write_rc=%d CC=%#x cc_rc=%d CSTS=%#x csts_rc=%d CAP=%#llx quirks=%#lx\n",
+		 stage, (unsigned long long)ktime_get_ns(), task_pid_nr(current),
+		 current->comm, ctrl, ctrl->ctrl_config, write_rc, cc, cc_rc,
+		 csts, csts_rc, (unsigned long long)ctrl->cap, ctrl->quirks);
+}
+
 static int nvme_wait_ready(struct nvme_ctrl *ctrl, u32 mask, u32 val,
 		u32 timeout, const char *op)
 {
 	unsigned long timeout_jiffies = jiffies + timeout * HZ;
-	u32 csts;
+	unsigned long started = jiffies;
+	unsigned long next_log = jiffies + 10 * HZ;
+	u64 started_ns = ktime_get_ns();
+	u32 csts = 0, last_csts = ~0U;
+	unsigned int polls = 0;
+	bool log_state = !strcmp(ctrl->ops->name, "pcie");
 	int ret;
 
 	while ((ret = ctrl->ops->reg_read32(ctrl, NVME_REG_CSTS, &csts)) == 0) {
-		if (csts == ~0)
-			return -ENODEV;
+		polls++;
+		if (log_state && (polls == 1 || csts != last_csts))
+			dev_info(ctrl->device,
+				 "ulan-nvme ready-sample: op=%s t_ns=%llu elapsed_ns=%llu mask=%#x expected=%#x CSTS=%#x poll=%u timeout_s=%u\n",
+				 op, (unsigned long long)ktime_get_ns(),
+				 (unsigned long long)(ktime_get_ns() - started_ns),
+				 mask, val, csts, polls, timeout);
+		last_csts = csts;
+		if (csts == ~0) {
+			ret = -ENODEV;
+			goto out;
+		}
 		if ((csts & mask) == val)
 			break;
+		if (mask == NVME_CSTS_RDY && val == NVME_CSTS_RDY &&
+		    time_after_eq(jiffies, next_log)) {
+			u32 cc = 0;
+			int cc_rc = ctrl->ops->reg_read32(ctrl, NVME_REG_CC, &cc);
+
+			dev_info(ctrl->device,
+				 "ulan-nvme wait-ready: elapsed_ms=%u CSTS=%#x CC=%#x cc_rc=%d\n",
+				 jiffies_to_msecs(jiffies - started), csts, cc, cc_rc);
+			next_log += 10 * HZ;
+		}
 
 		usleep_range(1000, 2000);
-		if (fatal_signal_pending(current))
-			return -EINTR;
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			goto out;
+		}
 		if (time_after(jiffies, timeout_jiffies)) {
 			dev_err(ctrl->device,
 				"Device not ready; aborting %s, CSTS=0x%x\n",
 				op, csts);
-			return -ENODEV;
+			ret = -ENODEV;
+			goto out;
 		}
 	}
-
+out:
+	if (log_state)
+		dev_info(ctrl->device,
+			 "ulan-nvme ready-return: op=%s t_ns=%llu elapsed_ns=%llu rc=%d CSTS=%#x polls=%u\n",
+			 op, (unsigned long long)ktime_get_ns(),
+			 (unsigned long long)(ktime_get_ns() - started_ns),
+			 ret, csts, polls);
 	return ret;
 }
 
@@ -2445,6 +2497,8 @@ int nvme_disable_ctrl(struct nvme_ctrl *ctrl, bool shutdown)
 {
 	int ret;
 
+	ulan_nvme_log_ctrl_state(ctrl,
+			shutdown ? "shutdown-entry" : "disable-entry", 0);
 	ctrl->ctrl_config &= ~NVME_CC_SHN_MASK;
 	if (shutdown)
 		ctrl->ctrl_config |= NVME_CC_SHN_NORMAL;
@@ -2452,6 +2506,8 @@ int nvme_disable_ctrl(struct nvme_ctrl *ctrl, bool shutdown)
 		ctrl->ctrl_config &= ~NVME_CC_ENABLE;
 
 	ret = ctrl->ops->reg_write32(ctrl, NVME_REG_CC, ctrl->ctrl_config);
+	ulan_nvme_log_ctrl_state(ctrl,
+			shutdown ? "shutdown-write" : "disable-write", ret);
 	if (ret)
 		return ret;
 
@@ -2473,6 +2529,7 @@ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
 	u32 timeout;
 	int ret;
 
+	ulan_nvme_log_ctrl_state(ctrl, "enable-entry", 0);
 	ret = ctrl->ops->reg_read64(ctrl, NVME_REG_CAP, &ctrl->cap);
 	if (ret) {
 		dev_err(ctrl->device, "Reading CAP failed (%d)\n", ret);
@@ -2504,6 +2561,7 @@ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
 	ctrl->ctrl_config |= NVME_CC_AMS_RR | NVME_CC_SHN_NONE;
 	ctrl->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
 	ret = ctrl->ops->reg_write32(ctrl, NVME_REG_CC, ctrl->ctrl_config);
+	ulan_nvme_log_ctrl_state(ctrl, "enable-config-write", ret);
 	if (ret)
 		return ret;
 
@@ -2539,6 +2597,7 @@ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
 
 	ctrl->ctrl_config |= NVME_CC_ENABLE;
 	ret = ctrl->ops->reg_write32(ctrl, NVME_REG_CC, ctrl->ctrl_config);
+	ulan_nvme_log_ctrl_state(ctrl, "enable-EN-write", ret);
 	if (ret)
 		return ret;
 	return nvme_wait_ready(ctrl, NVME_CSTS_RDY, NVME_CSTS_RDY,
