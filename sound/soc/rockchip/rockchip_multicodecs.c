@@ -75,6 +75,14 @@ struct multicodecs_data {
 	u32 keyup_voltage;
 	u32 pre_poweron_delayms;
 	u32 post_powerdown_delayms;
+	/*
+	 * ethan007: the speaker amplifier is on only while DAPM has the Speaker path up AND a playback stream runs
+	 * (trigger START .. STOP), so it never amplifies the codec powering up or down.
+	 */
+	spinlock_t spk_lock;
+	bool spk_follow_stream;
+	bool spk_powered;
+	bool spk_playing;
 	const struct adc_keys_button *map;
 	struct input_dev *input;
 	struct input_dev_poller *poller;
@@ -318,20 +326,46 @@ static int mc_hp_event(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
+/* ethan007: set the speaker amplifier from the two conditions; call with spk_lock held */
+static void mc_spk_update(struct multicodecs_data *mc_data)
+{
+	gpiod_set_value(mc_data->spk_ctl_gpio, mc_data->spk_powered && mc_data->spk_playing);
+}
+
 static int mc_spk_event(struct snd_soc_dapm_widget *w,
 			struct snd_kcontrol *kcontrol, int event)
 {
 	struct snd_soc_card *card = w->dapm->card;
 	struct multicodecs_data *mc_data = snd_soc_card_get_drvdata(card);
+	unsigned long flags;
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
 		if (mc_data->pre_poweron_delayms)
 			msleep(mc_data->pre_poweron_delayms);
-		gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 1);
+		/*
+		 * ethan007: DAPM runs this before the codec's bias reaches ON (its analog section powers up after it), and
+		 * also when a sound server only opens the device to probe it. Switching the amplifier on here made both
+		 * click, so the amplifier waits for a running stream (rk_multicodecs_trigger).
+		 */
+		if (!mc_data->spk_follow_stream) {
+			gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 1);
+			break;
+		}
+		spin_lock_irqsave(&mc_data->spk_lock, flags);
+		mc_data->spk_powered = true;
+		mc_spk_update(mc_data);
+		spin_unlock_irqrestore(&mc_data->spk_lock, flags);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
-		gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 0);
+		if (!mc_data->spk_follow_stream) {
+			gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 0);
+		} else {
+			spin_lock_irqsave(&mc_data->spk_lock, flags);
+			mc_data->spk_powered = false;
+			mc_spk_update(mc_data);
+			spin_unlock_irqrestore(&mc_data->spk_lock, flags);
+		}
 		if (mc_data->post_powerdown_delayms)
 			msleep(mc_data->post_powerdown_delayms);
 		break;
@@ -645,8 +679,41 @@ static int wait_locked_card(struct device_node *np, struct device *dev)
 	return ret;
 }
 
+/*
+ * ethan007: the link trigger runs first on START and last on STOP (SND_SOC_TRIGGER_ORDER_DEFAULT). So the amplifier
+ * comes on after prepare has powered and unmuted the codec, and goes off before hw_free mutes it.
+ */
+static int rk_multicodecs_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct multicodecs_data *mc_data = snd_soc_card_get_drvdata(rtd->card);
+	unsigned long flags;
+
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK || !mc_data->spk_follow_stream)
+		return 0;
+
+	spin_lock_irqsave(&mc_data->spk_lock, flags);
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		mc_data->spk_playing = true;
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		mc_data->spk_playing = false;
+		break;
+	}
+	mc_spk_update(mc_data);
+	spin_unlock_irqrestore(&mc_data->spk_lock, flags);
+
+	return 0;
+}
+
 static struct snd_soc_ops rk_ops = {
 	.hw_params = rk_multicodecs_hw_params,
+	.trigger = rk_multicodecs_trigger,
 };
 
 SND_SOC_DAILINK_DEFS(hifi,
@@ -938,6 +1005,9 @@ static int rk_multicodecs_probe(struct platform_device *pdev)
 							GPIOD_OUT_LOW);
 	if (IS_ERR(mc_data->spk_ctl_gpio))
 		return PTR_ERR(mc_data->spk_ctl_gpio);
+	/* ethan007: the trigger callback is atomic, so only a non-sleeping GPIO can follow the stream */
+	spin_lock_init(&mc_data->spk_lock);
+	mc_data->spk_follow_stream = mc_data->spk_ctl_gpio && !gpiod_cansleep(mc_data->spk_ctl_gpio);
 
 	mc_data->hp_ctl_gpio = devm_gpiod_get_optional(&pdev->dev,
 						       "hp-con",
@@ -996,6 +1066,9 @@ static void rk_multicodec_shutdown(struct platform_device *pdev)
 	struct multicodecs_data *mc_data = platform_get_drvdata(pdev);
 
 	cancel_delayed_work_sync(&mc_data->handler);
+	/* ethan007: the amplifiers off before the codec resets and the rails go down */
+	gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 0);
+	gpiod_set_value_cansleep(mc_data->hp_ctl_gpio, 0);
 }
 
 static const struct of_device_id rockchip_multicodecs_of_match[] = {
